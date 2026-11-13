@@ -135,4 +135,16 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(s['events']),12)
         self.assertTrue(all('Demo' in e['model'] for e in s['events']))
 
+    def test_texas_route_returns_unscreened_alternatives(self):
+        class Response:
+            def raise_for_status(self): pass
+            def json(self):
+                return {'code':'Ok','routes':[{'distance':4200,'duration':360,'geometry':{'coordinates':[[-95.37,29.76],[-95.35,29.78]]},'legs':[{'steps':[{'name':'Main Street'}]}]}]}
+        with patch.object(app.requests,'get',return_value=Response()):
+            result=app.route_options((29.76,-95.37),(29.78,-95.35))
+        self.assertEqual(result['options'][0]['distance_km'],4.2)
+        self.assertIn('INCOMPLETE COVERAGE',result['options'][0]['risk_level'])
+        self.assertEqual(result['options'][0]['roads'],['Main Street'])
+        with self.assertRaises(ValueError): app.route_options((40,-95),(29.78,-95.35))
+
 if __name__=='__main__':unittest.main()

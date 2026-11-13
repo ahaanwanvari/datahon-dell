@@ -1,6 +1,6 @@
-# Flood Change Explorer
+# Texas Flood Atlas
 
-Local interactive prototype for automatic satellite-image change discovery and dated evidence timelines. Qwen runs on your existing GB10 model server. Human approval is optional.
+Local Texas-focused flood decision-support prototype. It combines dated satellite-image change discovery with nearby public gauge, road-condition, and mapped flood-hazard context. Qwen runs on your existing GB10 model server. Human review is optional.
 
 ## Start
 
@@ -20,7 +20,17 @@ python3 -m venv .venv
 ./run.sh
 ```
 
-The initial collection contains 16 **synthetic** RGB images and 12 **prewritten** observations at four fictional locations. It demonstrates interactions and makes no claim about real flood events. No models are downloaded and no GPU workloads are stopped.
+The initial collection contains 16 **synthetic** RGB images and 12 **prewritten** observations at four fictional Texas locations. It demonstrates imagery review and makes no claim about real flood events. The Texas context panel starts at Houston and queries public NOAA NWPS gauges, TxDOT DriveTexas road conditions, and FEMA NFHL mapped flood hazards. A location search can use a Texas place name or coordinates. No Google Maps key is needed. No models are downloaded and no GPU workloads are stopped.
+
+## Texas decision context prototype
+
+The page organizes the concept into four phases: preparation, active-flood response context, responder prioritization, and recovery assessment. Search a Texas city/address or coordinates to inspect nearby source feeds, or use an imported image location. The context panel displays returned gauge readings/flood categories, road reports and mapped flood-zone records where supplied by the services. Route planning geocodes two Texas locations and returns OSRM alternatives with distance, approximate duration and road names. The app samples each returned route against FEMA flood hazard polygons and TxDOT flood/closure reports, then ranks the candidates by screening score. OSRM still generates the candidates and cannot avoid a reported segment when generating new paths; a matched closure is flagged prominently. Manually added facility/check-location notes are stored only in the local browser. A JSON incident brief can combine these notes with the selected imagery collection's observations. A recovery scenario calculator multiplies a user-supplied affected-building count by user-supplied low/high repair-cost assumptions; it is not an image-derived or FEMA loss estimate.
+
+Treat all output as exploratory context. NOAA gauges cover selected waterways, not every street or flash flood. A missing/zero TxDOT record is not proof that a road is open; the feed covers TxDOT-maintained roads, has terms limiting use, and access for the API may require an approved key. FEMA NFHL zones are mapped hazard designations, not live inundation. Route screening uses mapped background hazard and matching TxDOT reports; it does not predict flood depth or prove that remaining roads are passable. Check all conditions against official TxDOT and local emergency sources before travel. Manually entered facilities are unverified, and the app does not infer shelter safety from building height. The scenario calculator is only arithmetic over user-entered assumptions. It is not a damage estimate. Defensible loss estimation requires event-specific flood depth, building inventory/valuation, and a method such as FEMA Hazus; the app does not compute those inputs. For active emergencies follow local emergency management and NWS alerts; this prototype is not a dispatch or evacuation authority.
+
+Geocoding uses OpenStreetMap Nominatim with a Texas query suffix. Route calculation uses the public OSRM demo service. Entered place names/coordinates are sent to those services to geocode and calculate routes; these public demo endpoints have usage policies and are suitable only for low-volume prototyping. Production deployment should host its own routing service or use an approved service with an appropriate agreement. Map imagery and attribution are provided by OpenStreetMap.
+
+The VLM defaults to `Qwen/Qwen3-VL-8B-Instruct` at `http://127.0.0.1:8000/v1`. When running on the GB10, set `FLOOD_VLM_URL` to the GB10 model server address reachable from the app host. The model is only used for historical image-pair descriptions; it does not issue flood forecasts, route people, or estimate damage.
 
 ## Import and discover
 

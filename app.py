@@ -12,6 +12,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from functools import lru_cache
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -222,6 +223,153 @@ def snapshot():
     return dict(images=images, events=events, job=JOB.copy(), model=MODEL, endpoint=BASE)
 
 
+TX_GAUGES = 'https://api.water.noaa.gov/nwps/v1/gauges'
+TX_ALERTS = 'https://api.weather.gov/alerts/active'
+TX_ROADS = 'https://services.arcgis.com/KTcxiTD9dsQw4r7Z/arcgis/rest/services/DriveTexas_Lines/FeatureServer/0/query'
+TX_FLOOD_ZONES = 'https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28/query'
+
+
+def route_samples(coords, spacing_m=300):
+    samples=[]
+    for a,b in zip(coords,coords[1:]):
+        dx=(b[0]-a[0])*85000;dy=(b[1]-a[1])*111000
+        count=max(1,math.ceil(math.hypot(dx,dy)/spacing_m))
+        samples.extend([(a[0]+(b[0]-a[0])*i/count,a[1]+(b[1]-a[1])*i/count) for i in range(count)])
+    if coords: samples.append(tuple(coords[-1]))
+    return samples
+
+
+def point_in_geojson(lon,lat,geometry):
+    if not geometry:return False
+    typ=geometry.get('type'); coords=geometry.get('coordinates',[])
+    polygons=coords if typ=='MultiPolygon' else [coords] if typ=='Polygon' else []
+    inside=False
+    for polygon in polygons:
+        for ring in polygon[:1]:
+            hit=False;j=len(ring)-1
+            for i,(x,y) in enumerate(ring):
+                xj,yj=ring[j]
+                if ((y>lat)!=(yj>lat)) and lon<(xj-x)*(lat-y)/(yj-y+1e-30)+x:hit=not hit
+                j=i
+            if hit:inside=not inside
+    return inside
+
+
+def point_near_lines(lon,lat,geometry,tolerance_m=35):
+    if not geometry:return False
+    typ=geometry.get('type');coords=geometry.get('coordinates',[])
+    lines=coords if typ=='MultiLineString' else [coords] if typ=='LineString' else []
+    px,py=lon*85000,lat*111000
+    for line in lines:
+        for a,b in zip(line,line[1:]):
+            ax,ay=a[0]*85000,a[1]*111000;bx,by=b[0]*85000,b[1]*111000
+            dx,dy=bx-ax,by-ay;den=dx*dx+dy*dy
+            t=max(0,min(1,((px-ax)*dx+(py-ay)*dy)/den)) if den else 0
+            if math.hypot(px-(ax+t*dx),py-(ay+t*dy))<=tolerance_m:return True
+    return False
+
+
+def route_hazard_context(route_coords):
+    samples=route_samples(route_coords)
+    if not samples:return {'available':False,'reason':'Route geometry is empty.'}
+    minlon=min(p[0] for p in samples)-.015;maxlon=max(p[0] for p in samples)+.015
+    minlat=min(p[1] for p in samples)-.015;maxlat=max(p[1] for p in samples)+.015
+    query_geom=f'{minlon},{minlat},{maxlon},{maxlat}'
+    hazards=[];reports=[];sources={}
+    queries=[('fema',TX_FLOOD_ZONES,{'f':'geojson','where':'1=1','geometry':query_geom,'geometryType':'esriGeometryEnvelope','inSR':4326,'spatialRel':'esriSpatialRelIntersects','outFields':'FLD_ZONE,ZONE_SUBTY,SFHA_TF','returnGeometry':'true','resultRecordCount':500}),
+             ('txdot',TX_ROADS,{'f':'geojson','where':'1=1','geometry':query_geom,'geometryType':'esriGeometryEnvelope','inSR':4326,'spatialRel':'esriSpatialRelIntersects','outFields':'CNSTRNT_TYPE_CD,RDWAY_NM,COND_DSCR,COND_START_TS,COND_END_TS,TRVL_DRCT_CD','returnGeometry':'true','resultRecordCount':500})]
+    for key,url,params in queries:
+        try:
+            r=requests.get(url,params=params,headers={'User-Agent':'TexasFloodAtlas/1.0'},timeout=(4,18));r.raise_for_status();features=r.json().get('features',[]);sources[key]={'available':True,'as_of':r.headers.get('Date'),'count':len(features)}
+            if key=='fema':hazards=features
+            else:reports=features
+        except Exception as exc:sources[key]={'available':False,'error':str(exc)[:140]}
+    exposed=[]
+    for lon,lat in samples:
+        if any(point_in_geojson(lon,lat,f.get('geometry')) for f in hazards):exposed.append((lon,lat))
+    closure_hits=[]
+    for feature in reports:
+        props=feature.get('properties') or {};typ=str(props.get('CNSTRNT_TYPE_CD') or '').upper();text=' '.join(str(props.get(k) or '') for k in ('CNSTRNT_TYPE_CD','COND_DSCR','RDWAY_NM')).lower()
+        flood='flood' in text or typ=='F';closed=typ=='Z' or 'closed' in text or 'closure' in text
+        if not (closed or flood):continue
+        geom=feature.get('geometry')
+        if any(point_near_lines(lon,lat,geom) for lon,lat in samples):
+            closure_hits.append({'road':props.get('RDWAY_NM') or 'TxDOT roadway','type':typ,'description':props.get('COND_DSCR') or ('Flood report' if flood else 'Closure report'),'closed':closed,'flood_report':flood})
+    frac=len(exposed)/max(1,len(samples));closed_count=sum(1 for x in closure_hits if x['closed']);flood_count=sum(1 for x in closure_hits if x['flood_report'])
+    score=min(100,round(frac*45+closed_count*35+flood_count*30))
+    coverage_complete=all(sources.get(k,{}).get('available') for k in ('fema','txdot'))
+    if closed_count or flood_count:level='REPORTED ROAD HAZARD — avoid pending official confirmation'
+    elif frac>.25:level='ELEVATED BACKGROUND EXPOSURE — route crosses mapped FEMA flood hazard areas'
+    elif not sources.get('fema',{}).get('available') or not sources.get('txdot',{}).get('available'):level='INCOMPLETE COVERAGE — unknown road risk'
+    else:level='NO MATCHING REPORTS — not an all-clear; street-level conditions remain unknown'
+    return {'risk_score':score if coverage_complete else None,'risk_level':level,'sampled_points':len(samples),'fema_zone_sample_fraction':round(frac,3) if sources.get('fema',{}).get('available') else None,'txdot_hazards':closure_hits[:20],'sources':sources,'method':'Route geometry sampled every ~300 m. FEMA polygons represent mapped background hazard, not current water. TxDOT line reports are matched within 35 m. Missing coverage remains unknown.'}
+def route_options(origin, destination, alternatives=3):
+    lat1, lon1 = origin; lat2, lon2 = destination
+    if not (25.8 <= lat1 <= 36.6 and 25.8 <= lat2 <= 36.6 and -106.7 <= lon1 <= -93.4 and -106.7 <= lon2 <= -93.4):
+        raise ValueError('Origin and destination must both be inside Texas.')
+    url = f'https://router.project-osrm.org/route/v1/driving/{lon1},{lat1};{lon2},{lat2}'
+    response = requests.get(url, params={'alternatives': 'true', 'overview': 'full', 'geometries': 'geojson', 'steps': 'true'}, headers={'User-Agent': 'TexasFloodAtlas/1.0'}, timeout=(4, 20))
+    response.raise_for_status(); payload = response.json()
+    if payload.get('code') != 'Ok' or not payload.get('routes'): raise ValueError('No road route returned for these points.')
+    options=[]
+    for idx, route in enumerate(payload['routes'][:alternatives], 1):
+        steps=[s.get('name') for leg in route.get('legs',[]) for s in leg.get('steps',[]) if s.get('name')]
+        coords=route['geometry']['coordinates'];risk=route_hazard_context(coords)
+        options.append({'rank':idx,'distance_km':round(route['distance']/1000,2),'duration_min':round(route['duration']/60),'geometry':coords,'roads':list(dict.fromkeys(steps))[:24],**risk})
+    options.sort(key=lambda x:(x['risk_score'] is None, x['risk_score'] if x['risk_score'] is not None else 101,x['distance_km']))
+    for rank,option in enumerate(options,1):option['rank']=rank
+    return {'road_source':'OpenStreetMap road network via OSRM public demo router','ranking':'Risk-screened among returned candidates; service may return only a subset. TxDOT reports are warnings, not guaranteed complete closures.','options':options}
+
+
+@lru_cache(maxsize=16)
+def texas_context(lat, lon):
+    """Fetch a small, cached Texas context bundle. Failures are surfaced per layer."""
+    result = {'state': 'Texas', 'layers': {}, 'alerts': [], 'gauges': [], 'road_conditions': [], 'flood_hazards': []}
+    # A 25 km bbox keeps the response local to the selected map location.
+    bbox = f'{lon-0.25},{lat-0.25},{lon+0.25},{lat+0.25}'
+    calls = [
+        ('alerts', TX_ALERTS, {'point': f'{lat},{lon}'}),
+        ('gauges', TX_GAUGES, {'bbox.xmin': lon-0.25, 'bbox.ymin': lat-0.25, 'bbox.xmax': lon+0.25, 'bbox.ymax': lat+0.25, 'srid': 'EPSG_4326'}),
+        ('road_conditions', TX_ROADS, {'f': 'geojson', 'where': '1=1', 'geometry': f'{lon-0.25},{lat-0.25},{lon+0.25},{lat+0.25}', 'geometryType': 'esriGeometryEnvelope', 'inSR': 4326, 'spatialRel': 'esriSpatialRelIntersects', 'outFields': '*', 'returnGeometry': 'true', 'resultRecordCount': 100}),
+        ('flood_hazards', TX_FLOOD_ZONES, {'f': 'geojson', 'where': '1=1', 'geometry': f'{lon-0.1},{lat-0.1},{lon+0.1},{lat+0.1}', 'geometryType': 'esriGeometryEnvelope', 'inSR': 4326, 'spatialRel': 'esriSpatialRelIntersects', 'outFields': 'FLD_ZONE,ZONE_SUBTY,SFHA_TF', 'returnGeometry': 'false', 'resultRecordCount': 100})]
+    for key, url, params in calls:
+        try:
+            response = requests.get(url, params=params, headers={'User-Agent': 'TexasFloodAtlas (local prototype)', 'Accept': 'application/geo+json'}, timeout=(3, 12))
+            response.raise_for_status()
+            payload = response.json()
+            if key == 'alerts':
+                result['alerts'] = payload.get('features', [])[:30]
+            elif key == 'gauges':
+                rows = payload.get('gauges', payload.get('items', []))
+                result['gauges'] = rows[:30] if isinstance(rows, list) else []
+            elif key == 'road_conditions':
+                result['road_conditions'] = payload.get('features', [])[:100]
+            else:
+                result['flood_hazards'] = payload.get('features', [])[:100]
+            result['layers'][key] = {'available': True, 'source': url, 'as_of': response.headers.get('Last-Modified') or response.headers.get('Date')}
+        except Exception as exc:
+            result['layers'][key] = {'available': False, 'source': url, 'error': str(exc)[:180]}
+    return result
+
+
+def geocode_texas(query):
+    query = str(query).strip()[:160]
+    if not query:
+        raise ValueError('Enter a Texas city, address, or coordinates.')
+    if re.fullmatch(r'\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*', query):
+        lat, lon = map(float, re.split(r'\s*,\s*', query.strip()))
+        if 25.8 <= lat <= 36.6 and -106.7 <= lon <= -93.4:
+            return {'lat': lat, 'lon': lon, 'label': f'{lat:.5f}, {lon:.5f}'}
+        raise ValueError('Coordinates must be inside Texas.')
+    response = requests.get('https://nominatim.openstreetmap.org/search', params={'q': query + ', Texas, USA', 'format': 'jsonv2', 'limit': 5, 'countrycodes': 'us'}, headers={'User-Agent': 'TexasFloodAtlas/1.0 (local research prototype)'}, timeout=(3, 15))
+    response.raise_for_status()
+    for place in response.json():
+        lat, lon = float(place['lat']), float(place['lon'])
+        if 25.8 <= lat <= 36.6 and -106.7 <= lon <= -93.4:
+            return {'lat': lat, 'lon': lon, 'label': place.get('display_name', query)}
+    raise ValueError('Could not find a matching place in Texas.')
+
+
 def demo():
     with connect() as c:
         if c.execute("SELECT 1 FROM images WHERE collection='demo'").fetchone():
@@ -284,6 +432,22 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path in ('/api/state','/api/export'):
             return self.send_json(snapshot())
+        if parsed.path == '/api/texas-context':
+            try:
+                query = parse_qs(parsed.query)
+                lat, lon = float(query['lat'][0]), float(query['lon'][0])
+                if not (25.8 <= lat <= 36.6 and -106.7 <= lon <= -93.4):
+                    raise ValueError('Location must be inside Texas.')
+                return self.send_json(texas_context(round(lat, 3), round(lon, 3)))
+            except Exception as exc:
+                return self.send_json({'error': str(exc)}, 400)
+        if parsed.path == '/api/route':
+            try:
+                q = parse_qs(parsed.query)
+                values = [float(q[k][0]) for k in ('olat','olon','dlat','dlon')]
+                return self.send_json(route_options((values[0],values[1]),(values[2],values[3])))
+            except Exception as exc:
+                return self.send_json({'error': str(exc)}, 400)
         if parsed.path == '/api/image':
             ident = parse_qs(parsed.query).get('id',[''])[0]
             with connect() as c:
@@ -331,6 +495,8 @@ class Handler(BaseHTTPRequestHandler):
                 finally:
                     LOCK.release()
                 return self.send_json({'count':count})
+            if self.path == '/api/geocode':
+                return self.send_json(geocode_texas(body.get('query', '')))
             if self.path == '/api/index':
                 start_job(); return self.send_json({'started':True})
             if self.path == '/api/review':
