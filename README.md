@@ -2,6 +2,153 @@
 
 Local Texas-focused flood decision-support prototype. It combines dated satellite-image change discovery with nearby public gauge, road-condition, and mapped flood-hazard context. Qwen runs on your existing GB10 model server. Human review is optional.
 
+## Automatic photo location
+
+Uploaded photos are checked against an index of 1,200 georeferenced UTSA images.
+Original files and unchanged re-encodings can match exactly; conservative visual
+fingerprints also recognize resized/recompressed copies. Ambiguous candidates
+remain suggestions with source thumbnails. This is local dataset matching, not
+a worldwide photo-location model. Unknown photos use GPS metadata when available,
+or an address/coordinates entered by the user.
+
+The confirmation map shows a proposed pin and, for dataset matches, the source
+image's ground footprint. Aerial dataset coordinates are footprint centers, not
+verified camera positions or street addresses. Click the map to move the pin,
+use arrow keys for adjustments, then choose **This is the photo location**.
+Destination lookup is disabled until confirmation, and the server independently
+enforces that rule. Editing the location requires a new map confirmation. A
+confirmed new pin clears destinations calculated for the old pin.
+
+Destination cards include numeric latitude/longitude and map links. They remain
+planning references unless current status and route evidence support more.
+
+The index builds from `image_metadata.csv` under
+`FLOOD_IMAGE_DATA` (default `/home/dell/jupyterlab/Texas_Flood_Student_Data`) and is
+cached in `.state/photo-locations.npz`. Build it explicitly with
+`python photo_location.py`. Matching and map confirmation do not load model weights
+or start training. See `training/PHOTO_LOCATION.md` for validation and limits.
+
+## Photo-to-flood preview
+
+The **Flood preview** view accepts JPEG, PNG and WebP photos. Select a minor,
+moderate or severe visual scenario and choose **Generate flooded view**. Atlas v2
+describes the original scene; a separate local FLUX.2 Klein 4B image editor
+creates the flooded illustration. A slider compares the source photo with the
+generated image. Both models stay resident between requests. No training runs.
+
+The same button automatically runs Qwen's review of the generated flood image after generation finishes. Its explanation appears
+below the viewer. Info markers on the original photo can be hovered, focused or
+tapped for visible evidence and access checks. Slide toward Original to reveal
+all annotations. They mark features to verify, not certified safe refuges.
+Grounding may use base Qwen with the resident adapter temporarily disabled;
+review and image editing still reuse the persistent inference service.
+See `training/AUTOMATIC_PHOTO_REVIEW.md` for provenance and limits.
+
+Generated water is an illustration, not a physical inundation model. It does not
+establish flood extent, depth, probability, timing, or road passability.
+
+After generation, enter the photo's address or coordinates and choose **Find
+nearby options**. JPEG GPS metadata can prefill coordinates; device location is
+used only after choosing that button. Always confirm that the location matches
+the photo. Coordinates, not the photo, are sent to public map/data services.
+
+Planning combines FEMA shelter listings, terrain elevations and an Atlas v2
+assessment restricted to source-backed candidate IDs. Sites without confirmed
+current availability are marked as planning locations to contact, not operating
+shelters. Higher terrain is not proof of safety. Unknown or unfavorable route
+coverage is shown explicitly and does not become a route recommendation.
+Shelter listings are U.S.-focused; the existing FEMA/TxDOT route screening is
+Texas-only. Outside supported coverage the app reports missing information and
+links to official sources rather than inventing destinations. Tall buildings
+are not automatically treated as shelters.
+
+Images and job records are stored locally under `.state/scenarios/`. Jobs can be
+reopened after refreshing the page. If the app restarts during an active job,
+the job is marked interrupted and can be generated again.
+
+The pinned editor model and download path are recorded in
+`inference/flood_model.json`. To install its weights on the prepared machine:
+
+```bash
+python deployment/install-image-model.py
+```
+
+The prepared model environment includes Diffusers 0.40.0 and the existing
+Torch/Transformers stack. The API reports image-model installation and loading
+status at `/health`. See `training/FLOOD_SCENARIOS.md` for provenance and checks.
+
+## Integrated Atlas v2 system
+
+On the prepared GB10 machine, use `./run-integrated.sh` to start the local app
+and the shared inference API together. The existing checkpoint must already
+exist; this command never runs training or validation. If port 8765 is occupied,
+use `FLOOD_PORT=8766 ./run-integrated.sh`.
+
+The API listens on `127.0.0.1:8001`; both paired timeline analysis and the
+photo upload and question tools use Atlas v2. One resident model serves
+all requests sequentially. The first request after service startup loads weights;
+subsequent requests reuse them, even when a notebook kernel restarts. A service
+restart requires another load. `/health` reports checkpoint hash, load count,
+request count and readiness. The app caches observations using a model ID that
+includes the adapter fingerprint. Changing the adapter requires a service and
+app restart, so requests cannot silently change checkpoints.
+
+The service holds the existing exclusive GPU lock and pauses `qwen-vl-server`
+while resident. It restores that container on graceful shutdown. Do not run the
+older notebook-only worker alongside it; finish its query and call its original
+`predict.close_model()` before starting the shared service. Training, if started
+separately, must wait until the shared service is stopped.
+
+For a notebook that never owns model weights:
+
+```python
+import sys
+sys.path.insert(0, "/home/dell/datahon-dell-review")
+from inference.client import ask_image
+
+answer = ask_image("/absolute/path/to/image.png", "Is flooding visible? Explain the evidence.")
+print(answer)
+```
+
+The existing `flood_training/predict.py` helper on this machine is also connected
+through `flood_training/inference_service.json`. Reload that helper once when
+switching an already-open notebook. `predict.close_model()` only releases an
+older private worker; it does not unload the shared service.
+
+Configuration: `FLOOD_TRAINING_HOME` identifies the checkpoint workspace,
+`FLOOD_MODEL_PYTHON` the prepared model interpreter, `FLOOD_INFERENCE_PORT`
+the local API port, and `FLOOD_PORT` the app port. Standalone API startup is
+`<model-python> inference/server.py`. It requires the prepared Torch,
+Transformers and PEFT environment described in `training/README.md`.
+
+Atlas JSON is validated by the application after generation. The local API does
+not advertise grammar-constrained decoding. Malformed answers fail visibly
+rather than becoming observations. Preview resolution is consistently capped at
+448 pixels; model evaluation limitations in `training/RESULTS.md` still apply.
+The public feeds, routing and recovery calculator keep their existing functions.
+
+### Services on this machine
+
+The integrated app is running at **http://127.0.0.1:8766**, independently of the
+older app on port 8765. Per-user services keep the API outside notebook kernels:
+
+```bash
+systemctl --user status flood-atlas-inference flood-atlas-app
+journalctl --user -u flood-atlas-inference -f
+# Restart just the frontend/backend app without unloading model weights:
+systemctl --user restart flood-atlas-app
+# Release the GPU when finished (stop the app before its inference service):
+systemctl --user stop flood-atlas-app flood-atlas-inference
+# Start again; weights load on its first question:
+systemctl --user start flood-atlas-app
+```
+
+To reproduce these service definitions, run
+`python3 deployment/install-local-services.py`, then start the app service. This
+installer only writes configuration; it does not start inference or training.
+Services are not enabled to start automatically at login. The standalone
+launcher remains available when these services are stopped.
+
 ## Start
 
 On this computer:
@@ -84,7 +231,7 @@ The server binds to loopback, rejects foreign Host headers and cross-origin writ
 ## Validation
 
 ```bash
-python -m unittest -v test_app
+python -m unittest -v test_app test_inference test_scenarios test_photo_location test_scene_analysis test_flood_lookup
 ```
 
 Tests cover import atomicity, within-location pairing, cache reuse and annotation preservation, failure continuation/retries, and synthetic provenance. Browser checks were also run against desktop and mobile widths for selection, search, empty results, swipe, timeline navigation, annotations and the importer dialog. A live Qwen check uses synthetic imagery solely to validate the connection and output schema; it cannot establish real flood accuracy.
@@ -113,3 +260,7 @@ Import the resulting `explorer_manifest.csv` through **Manage imagery**, then ru
 ## Attribution
 
 Originally developed in the [GB10competition](https://github.com/jennifer-fowler/GB10competition) workspace. Distributed under the GNU GPL v3; see LICENSE. Source imagery retains its original agency and dataset attribution.
+
+## Local model adaptation
+
+See [the model assessment](training/ANALYSIS.md) and [training instructions](training/README.md) for the local Qwen adapter run using labeled FloodNet VQA, UTSA replay and identical-image controls. Checkpoints and evaluation artifacts stay outside the source checkout. Training creates an adapter; the app continues to use its configured `FLOOD_VLM_URL` and `FLOOD_MODEL` until serving is configured separately.

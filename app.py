@@ -29,6 +29,13 @@ DB = STATE / 'explorer.sqlite'
 BASE = os.environ.get('FLOOD_VLM_URL', 'http://127.0.0.1:8000/v1').rstrip('/')
 MODEL = os.environ.get('FLOOD_MODEL', 'Qwen/Qwen3-VL-8B-Instruct')
 KEY = os.environ.get('FLOOD_API_KEY', 'NONE')
+LOCAL_ATLAS = os.environ.get('FLOOD_LOCAL_ATLAS') == '1'
+if LOCAL_ATLAS:
+    metadata = requests.get(BASE.removesuffix('/v1') + '/health', timeout=10)
+    metadata.raise_for_status()
+    MODEL = metadata.json()['model']
+    if not MODEL.startswith('atlas-v2-'):
+        raise RuntimeError('Expected fingerprinted Atlas v2 endpoint.')
 LOCK = threading.Lock()
 JOB = dict(running=False, done=0, total=0, message='Ready', errors=[])
 
@@ -111,7 +118,7 @@ def import_manifest(path):
 def encoded(path):
     with Image.open(path) as im:
         im = im.convert('RGB')
-        im.thumbnail((768, 768))
+        im.thumbnail((448, 448) if LOCAL_ATLAS else (768, 768))
         out = io.BytesIO()
         im.save(out, format='JPEG', quality=85)
     return 'data:image/jpeg;base64,' + base64.b64encode(out.getvalue()).decode()
@@ -131,7 +138,7 @@ def analyze(a, b):
     r = requests.post(BASE + '/chat/completions', headers={'Authorization': 'Bearer ' + KEY},
         json={'model': MODEL, 'temperature': 0, 'max_tokens': 650,
               'chat_template_kwargs': {'enable_thinking': False},
-              'response_format': {'type': 'json_schema', 'json_schema': {
+              **({} if LOCAL_ATLAS else {'response_format': {'type': 'json_schema', 'json_schema': {
                   'name': 'change_observation', 'strict': True, 'schema': {
                       'type': 'object', 'additionalProperties': False,
                       'properties': {
@@ -139,12 +146,15 @@ def analyze(a, b):
                           'kind': {'type': 'string', 'enum': ['water_increase','water_decrease','stable','uncertain']},
                           'strength': {'type': 'number', 'minimum': 0, 'maximum': 1},
                           'uncertainty': {'type': 'string'}, 'evidence': {'type': 'string'}},
-                      'required': ['summary','kind','strength','uncertainty','evidence']}}},
+                      'required': ['summary','kind','strength','uncertainty','evidence']}}}}),
               'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': prompt},
                   {'type': 'image_url', 'image_url': {'url': encoded(a['path'])}},
-                  {'type': 'image_url', 'image_url': {'url': encoded(b['path'])}}]}]}, timeout=(10, 180))
+                  {'type': 'image_url', 'image_url': {'url': encoded(b['path'])}}]}]}, timeout=(10, 900 if LOCAL_ATLAS else 180))
     r.raise_for_status()
-    content = r.json()['choices'][0]['message']['content']
+    payload = r.json()
+    if LOCAL_ATLAS and payload.get('model') != MODEL:
+        raise ValueError('Inference checkpoint identity changed; restart the app.')
+    content = payload['choices'][0]['message']['content']
     match = re.search(r'\{.*\}', content, re.S)
     if not match:
         raise ValueError('Model did not return JSON')
@@ -370,6 +380,10 @@ def geocode_texas(query):
     raise ValueError('Could not find a matching place in Texas.')
 
 
+from scenarios import Scenarios
+SCENARIOS = Scenarios(STATE, BASE, MODEL, route_options)
+
+
 def demo():
     with connect() as c:
         if c.execute("SELECT 1 FROM images WHERE collection='demo'").fetchone():
@@ -430,6 +444,28 @@ class Handler(BaseHTTPRequestHandler):
         if not self.valid_host():
             return self.send_json({'error':'Local access only'},403)
         parsed = urlparse(self.path)
+        match = re.fullmatch(r'/api/scenarios/([0-9a-f]{32})(?:/(original|generated)\.png)?', parsed.path)
+        if match:
+            try:
+                identity, kind = match.groups()
+                if kind:
+                    data=(SCENARIOS.folder(identity)/(kind+'.png')).read_bytes()
+                    self.send_response(200);self.send_header('Content-Type','image/png')
+                    self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
+                    return
+                return self.send_json(SCENARIOS.read(identity))
+            except (ValueError,FileNotFoundError) as exc:return self.send_json({'error':str(exc)},404)
+
+        if parsed.path == '/api/location-reference':
+            try:
+                image_id=parse_qs(parsed.query).get('id',[''])[0]
+                path=SCENARIOS.locator.reference(image_id)
+                with Image.open(path) as image:
+                    image=image.convert('RGB');image.thumbnail((240,240));buffer=io.BytesIO();image.save(buffer,format='JPEG')
+                data=buffer.getvalue();self.send_response(200);self.send_header('Content-Type','image/jpeg')
+                self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
+                return
+            except (ValueError,OSError) as exc:return self.send_json({'error':str(exc)},404)
         if parsed.path in ('/api/state','/api/export'):
             return self.send_json(snapshot())
         if parsed.path == '/api/texas-context':
@@ -484,9 +520,42 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({'error':'Cross-origin request rejected'},403)
         try:
             length = int(self.headers.get('Content-Length',0))
-            if not 0 < length < 65536:
+            limit = 24 * 1024 * 1024 if self.path == '/api/scenarios' else (3 * 1024 * 1024 if self.path == '/api/ask' else 65536)
+            if not 0 < length < limit:
                 raise ValueError('Invalid request size')
             body = json.loads(self.rfile.read(length))
+            if self.path == '/api/scenarios':
+                if not LOCAL_ATLAS:raise ValueError('Start the integrated local model service first.')
+                return self.send_json(SCENARIOS.start(body),202)
+            location_match=re.fullmatch(r'/api/scenarios/([0-9a-f]{32})/(locate|confirm-location)',self.path)
+            if location_match:
+                identity,action=location_match.groups()
+                if action=='locate':return self.send_json(SCENARIOS.resolve_location(identity,body.get('query')))
+                return self.send_json(SCENARIOS.confirm_location(identity,body['lat'],body['lon']))
+            plan_match=re.fullmatch(r'/api/scenarios/([0-9a-f]{32})/plan',self.path)
+            if plan_match:
+                return self.send_json(SCENARIOS.start_plan(plan_match[1],body.get('location')),202)
+            if self.path == '/api/ask':
+                if not LOCAL_ATLAS:
+                    raise ValueError('Start the integrated Atlas service to ask image questions.')
+                prompt = body.get('prompt', '')
+                images = body.get('images', [])
+                if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 20000:
+                    raise ValueError('Provide a question up to 20000 characters.')
+                if not isinstance(images, list) or not 1 <= len(images) <= 2:
+                    raise ValueError('Provide one image or an ordered before/after pair.')
+                if any(not isinstance(image, str) or not image.startswith(('data:image/jpeg;base64,', 'data:image/png;base64,')) for image in images):
+                    raise ValueError('Provide PNG or JPEG image data.')
+                response = requests.post(BASE + '/chat/completions', json={
+                    'model': MODEL, 'temperature': 0, 'max_tokens': 512,
+                    'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': prompt},
+                        *[{'type': 'image_url', 'image_url': {'url': image}} for image in images]]}]},
+                    timeout=(10, 900))
+                response.raise_for_status()
+                record = response.json()
+                if record.get('model') != MODEL:
+                    raise ValueError('Inference checkpoint identity changed; restart the app.')
+                return self.send_json({'answer': record['choices'][0]['message']['content'], 'model': MODEL})
             if self.path == '/api/import':
                 if not LOCK.acquire(blocking=False):
                     raise ValueError('Wait for indexing to finish before replacing imagery.')
